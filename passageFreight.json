@@ -1,0 +1,8 @@
+{
+"1":	{"high": 9000	, "middle": 6500	,"basic": 2000	,"low": 700	    , "freight": 1000},
+"2":	{"high": 14000	, "middle": 10000	,"basic": 3000	,"low": 1300	, "freight": 1600},
+"3":	{"high": 21000	, "middle": 14000	,"basic": 5000	,"low": 2200	, "freight": 2600},
+"4":	{"high": 34000	, "middle": 23000	,"basic": 8000	,"low": 3900	, "freight": 4400},
+"5":	{"high": 60000	, "middle": 40000	,"basic": 14000	,"low": 7200	, "freight": 8500},
+"6":	{"high": 210000	, "middle": 130000	,"basic": 55000	,"low": 27000	, "freight": 32000}
+}
