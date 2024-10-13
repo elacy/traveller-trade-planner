@@ -279,7 +279,7 @@ class World:
             modifier -= 2
 
         upper = self.data_loader.passenger_count(math.ceil(roll))
-        lower = self.data_loader.passenger_count(math.ceil(roll))
+        lower = self.data_loader.passenger_count(math.floor(roll))
 
         return (upper + lower) /2
 
@@ -631,6 +631,7 @@ class Route:
 
         current_world = self.worlds[-1]
         trade_goods = self.data_loader.trade_goods()
+        starting_world = self.total_duration == 0
 
         for other_world in current_world.neighbours:
             if self.complete_condition.destination and other_world in self.worlds:
@@ -662,14 +663,14 @@ class Route:
             cost = self.ship.fuel_cost(distance)
             text.append(f"Buy unrefined fuel for {cost}, capital {capital:,.2f}->{capital - cost:,.2f}")
             capital -= cost
-            starting_capital, final_capital, deals = current_world.best_trades(other_world, trade_goods, self.ship, capital, len(self.worlds) == 1)
+            starting_capital, final_capital, deals = current_world.best_trades(other_world, trade_goods, self.ship, capital, starting_world)
 
             if starting_capital is None:
                 continue
 
             text += deals
 
-            passenger_revenue, description = current_world.passengers(other_world, self.ship, len(self.worlds) == 1)
+            passenger_revenue, description = current_world.passengers(other_world, self.ship, starting_world)
 
             if passenger_revenue > 0: 
                 text.append(f"{description}, capital {final_capital:,.2f}->{passenger_revenue + final_capital:,.2f}")
