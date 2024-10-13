@@ -375,7 +375,7 @@
     },
     {
         "d66": 22,
-        "name": "Advanced Machine Part",
+        "name": "Advanced Machine Parts",
         "availability": [
             "In",
             "Ht"
@@ -1726,7 +1726,7 @@
     },
     {
         "d66": 62,
-        "name": "Cybernetics, Illegal",
+        "name": "Illegal Cybernetics",
         "availability": [
             "Ht"
         ],
@@ -1781,7 +1781,7 @@
     },
     {
         "d66": 63,
-        "name": "Drugs,Illegal",
+        "name": "Illegal Drugs",
         "availability": [
             "As",
             "De",
@@ -1839,7 +1839,7 @@
     },
     {
         "d66": 64,
-        "name": "Luxuries,Illegal",
+        "name": "Illegal Luxuries",
         "availability": [
             "Ag",
             "Ga",
@@ -1896,7 +1896,7 @@
     },
     {
         "d66": 65,
-        "name": "Weapons,Illegal",
+        "name": "Illegal Weapons",
         "availability": [
             "In",
             "Ht"
@@ -1952,7 +1952,7 @@
     },
     {
         "d66": 66,
-        "name": "Exotic",
+        "name": "Exotic Goods",
         "availability": [
             "SP"
         ],

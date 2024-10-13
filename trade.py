@@ -4,6 +4,10 @@ import requests
 import os.path
 from pathlib import Path
 import heapq
+from bs4 import BeautifulSoup
+import hashlib
+from urllib.parse import urlparse, parse_qs
+import pulp
 
 AVERAGE_D6 = 3.5
 
@@ -40,9 +44,13 @@ class TradeGood:
         self.__max_law_level = data["maxLawLevel"]
         self.data_loader = data_loader
 
-    def tons_available(self, world):
-        if not self.is_available(world):
+    def tons_available(self, world, starting_planet):
+        if not self.is_available(world, starting_planet):
             return 0
+        
+        if starting_planet and world.has_snapshot():
+            snapshot = world.get_purchase_snapshot(self.name)
+            return snapshot["tons"]
 
         modifier = 0
 
@@ -54,7 +62,11 @@ class TradeGood:
         dice_roll = (self.__tons_dice * AVERAGE_D6) + modifier
         return dice_roll * self.__tons_multiplier
     
-    def is_available(self, world):
+    def is_available(self, world, starting_planet):
+        if starting_planet and world.has_snapshot():
+            snapshot = world.get_purchase_snapshot(self.name)
+            return snapshot is not None and snapshot["tons"] != 0
+
         if world.size is None:
             return False
 
@@ -74,11 +86,19 @@ class TradeGood:
         
         return self.__max_law_level <= world.law
     
-    def purchase_price(self, skill, world):
+    def purchase_price(self, skill, world, starting_planet):
+        if starting_planet and world.has_snapshot():
+            snapshot = world.get_purchase_snapshot(self.name)
+            return snapshot["currentPrice"]
+        
         return self.__best_price(world, skill, "purchase")
 
     
-    def sale_price(self, skill, world):
+    def sale_price(self, skill, world, starting_planet):
+        if starting_planet and world.has_snapshot():
+            snapshot = world.get_sale_snapshot(self.name)
+            return snapshot["currentPrice"]
+
         return self.__best_price(world, skill, "sale")
     
 
@@ -123,6 +143,7 @@ class World:
         self.data_loader = data_loader
         self.__neighbours = None
         self.allegiance = data["Allegiance"]
+        self.__trade_snapshot = None
 
         self.remarks = data["Remarks"].split()
 
@@ -144,6 +165,53 @@ class World:
     
     def __repr__(self) -> str:
         return self.sector_hex.__repr__()
+    
+    def set_trade_snapshot(self, snapshot):
+        self.__trade_snapshot = snapshot
+
+    def get_sale_snapshot(self, good):
+        if self.__trade_snapshot is None:
+            return None
+
+        for item in self.__trade_snapshot["desiredGoods"]:
+            if item["type"] == good:
+                return item
+        
+        return None
+    
+    def freight_snapshot(self, cargo):
+        if not self.has_snapshot():
+            return None, None
+        
+        problem = pulp.LpProblem('Freight', pulp.LpMaximize)
+        total = 0
+        vars = []
+
+        for item in self.__trade_snapshot["freight"]:
+            variable = pulp.LpVariable(f"{item['tons']}x {item["contents"]}", cat="Binary")
+            total += item["tons"] * variable
+            vars.append(variable)
+
+        problem += total <= cargo
+        problem += total
+        problem.solve(pulp.PULP_CBC_CMD(msg=False))
+
+        freight = [self.__trade_snapshot["freight"][i] for i, variable in enumerate(vars) if pulp.value(variable) == 1]
+        freight = [f"{item['tons']}x {item["contents"]}" for item in freight]
+        return pulp.value(total), ",".join(freight)
+    
+    def has_snapshot(self):
+        return self.__trade_snapshot is not None
+
+    def get_purchase_snapshot(self, good):
+        if self.__trade_snapshot is None:
+            return None
+        
+        for item in self.__trade_snapshot["availableTradeGoods"]:
+            if item["type"] == good:
+                return item
+        
+        return None
 
     @property
     def neighbours(self):
@@ -156,9 +224,13 @@ class World:
     def neighbours(self, neighbours):
         self.__neighbours = neighbours
 
-    def __passenger_count(self, level, ship, other_world):
-        modifier = ship.max_steward
+    def __passenger_count(self, level, ship, other_world, starting_world):
         distance = self.distance(other_world)
+
+        if starting_world and self.has_snapshot():
+            return self.__trade_snapshot["passengers"][level]
+
+        modifier = ship.max_steward
 
         if distance > 1:
             modifier -= distance - 1
@@ -215,21 +287,27 @@ class World:
         y2 = other_world.y
         return round((((x1 - x2) ** 2) + ((y1-y2) ** 2)) ** (1/2))
     
-    def passengers(self, other_world, ship):
+    def passengers(self, other_world, ship, starting_world):
         distance = self.distance(other_world)
         passenger_revenue = 0
         passage_descriptions = []
 
         for passage in ship.passage:
-            passengers = min(self.__passenger_count(passage.type, ship, other_world), passage.number)
             ticket_price = self.data_loader.passage(passage.type, distance)
+            passengers = min(self.__passenger_count(passage.type, ship, other_world, starting_world), passage.number)
             passenger_revenue += passengers * ticket_price
             passage_descriptions.append(f"{passengers} {passage.type} at {ticket_price}")
+
+            if passage.type == "middle" and passengers < passage.number:
+                passengers = min(self.__passenger_count("basic", ship, other_world, starting_world), (passage.number - passengers) * 2)
+                ticket_price = self.data_loader.passage("basic", distance)
+                passenger_revenue += passengers * ticket_price
+                passage_descriptions.append(f"{passengers} basic at {ticket_price}")
 
         return passenger_revenue, f"Took on passengers: {", ".join(passage_descriptions)}"
 
 
-    def best_trades(self, other_world, trade_goods, ship, capital):
+    def best_trades(self, other_world, trade_goods, ship, capital, starting_planet):
         distance = self.distance(other_world)
         cargo = ship.cargo_capacity(distance)
         freight_per_ton = self.data_loader.passage("freight", distance)
@@ -245,7 +323,7 @@ class World:
         illegal = []
 
         for trade_good in trade_goods:
-            if not trade_good.is_available(self):
+            if not trade_good.is_available(self, starting_planet):
                 not_available.append(trade_good.name)
                 continue
 
@@ -253,19 +331,19 @@ class World:
                 illegal.append(trade_good.name)
                 continue
 
-            purchase_price = trade_good.purchase_price(ship.max_broker, self)
+            purchase_price = trade_good.purchase_price(ship.max_broker, self, starting_planet)
 
             if purchase_price > capital:
                 unaffordable.append(trade_good.name)
                 continue
 
-            sale_price = trade_good.sale_price(ship.max_broker, other_world)
+            sale_price = trade_good.sale_price(ship.max_broker, other_world, False)
 
             if sale_price - purchase_price < freight_per_ton:
                 no_profit.append(f"{trade_good.name} ({sale_price} - {purchase_price})")
                 continue
 
-            available_tons = trade_good.tons_available(self)
+            available_tons = trade_good.tons_available(self, starting_planet)
 
             available_tons = min(cargo, available_tons)
             available_tons = min(capital/ purchase_price, available_tons)
@@ -296,6 +374,12 @@ class World:
                 capital -= amount * deal.purchase_price
         
         if cargo > 0:
+            freight_revenue = 0
+
+            if starting_planet and self.has_snapshot() and distance == self.__trade_snapshot["maxJumpDistance"]:
+                cargo, text = self.freight_snapshot(cargo)
+                executed_deals.append(f"Carrying the following Freight: {text}")
+
             freight_revenue = cargo * freight_per_ton
             executed_deals.append(f"Do {cargo} tons of freight for {freight_revenue} capital: {final_capital:,.2f}->{final_capital + freight_revenue:,.2f}")
             final_capital += freight_revenue
@@ -572,14 +656,14 @@ class Route:
             cost = self.ship.fuel_cost(distance)
             text.append(f"Buy unrefined fuel for {cost}, capital {capital:,.2f}->{capital - cost:,.2f}")
             capital -= cost
-            starting_capital, final_capital, deals = current_world.best_trades(other_world, trade_goods, self.ship, capital)
+            starting_capital, final_capital, deals = current_world.best_trades(other_world, trade_goods, self.ship, capital, len(self.worlds) == 1)
 
             if starting_capital is None:
                 continue
 
             text += deals
 
-            passenger_revenue, description = current_world.passengers(other_world, self.ship)
+            passenger_revenue, description = current_world.passengers(other_world, self.ship, len(self.worlds) == 1)
 
             if passenger_revenue > 0: 
                 text.append(f"{description}, capital {final_capital:,.2f}->{passenger_revenue + final_capital:,.2f}")
@@ -698,7 +782,94 @@ class PerfectStrangerContract:
             return cut, f"Stern Metal takes 75% ({cut:,.2f}) of the of total profits {uncut_profit + profit:,.2f} since last world with a Bank of Amondiage, capital: {final_capital:,.2f} -> {final_capital - cut:,.2f}"
         else:
             return cut, f"Stern Metal takes 75% of the of total profits, capital: {final_capital:,.2f} -> {final_capital - cut:,.2f}"
+
+def parse_text(text):
+    try:
+        return float(text.replace(",", "").replace("%", ""))
+    except ValueError:
+        return text
     
+def to_camel_case(s):
+    # Split the string by spaces
+    words = s.split(' ')
+    # If there's only one word, return it as is
+    if len(words) == 1:
+        return words[0].lower()
+    # Convert the first word to lowercase and capitalize the subsequent words
+    camel_case = words[0].lower() + ''.join(word.capitalize() for word in words[1:])
+    return camel_case
+
+def parse_table(table):
+    rows = table.find_all('tr')
+
+    headers = None
+
+    for row in rows:
+        cells = row.find_all(['td', 'th'])
+        if headers is None:
+            headers = [to_camel_case(cell.get_text(strip=True)) for cell in cells]
+        else:
+            cell_values = [parse_text(cell.get_text(strip=True)) for cell in cells]
+            yield dict(zip(headers, cell_values))
+
+def get_md5_hash(text):
+    # Create an MD5 hash object
+    md5_hash = hashlib.md5()
+    # Update the hash object with the text (encoded to bytes)
+    md5_hash.update(text.encode('utf-8'))
+    # Return the hexadecimal representation of the hash
+    return md5_hash.hexdigest()
+
+def get_trade_snapshot_html(url):
+    cache_dir = "cache/tradeSnapshot"
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    hash = get_md5_hash(url)
+    snapshot_file = f"{cache_dir}/{hash}"
+
+    if os.path.isfile(snapshot_file):
+        with open(snapshot_file, 'rb') as file:
+            return file.read()
+    
+    with open(snapshot_file, 'wb') as file:
+        r = requests.get(url)
+        file.write(r.content)
+
+    return r.content
+
+
+def get_trade_snapshot(url):
+    result = get_trade_snapshot_html(url)
+    soup = BeautifulSoup(result, 'html.parser')
+    header = soup.find('h3', string='Available Trade Goods')
+    table = header.find_next('table')
+
+    d = {
+        "availableTradeGoods": list(parse_table(table))
+    }
+
+    header = soup.find('h3', string='Desired Goods')
+    table = header.find_next('table')
+
+    d["desiredGoods"] = list(parse_table(table))
+
+    header = soup.find('h3', string='Freight')
+    table = header.find_next('table')
+
+    d["freight"] = list(parse_table(table))
+
+    d["passengers"] = {
+        "high": len(soup.find_all("div", string="Passage Desired: High")),
+        "middle": len(soup.find_all("div", string="Passage Desired: Middle")),
+        "basic": len(soup.find_all("div", string="Passage Desired: Basic")),
+        "low": len(soup.find_all("div", string="Passage Desired: Low")),
+    }
+
+    parsed_url = urlparse(url)
+    query_params = parse_qs(parsed_url.query)
+
+    d["maxJumpDistance"] = int(query_params["maxJumpDistance"][0])
+
+    return d
 
 def main():
     perfect_stranger = Ship(8946.84, 40, 1, 40, 12, 160, [Passage("low", 9), Passage("middle", 10)], PerfectStrangerContract(), 2, 2)
@@ -708,14 +879,20 @@ def main():
     booty_pirates_trader = Ship(5516, 20, 2, 20,66, 20, [], Mortgage(47610000), 2, 4, ["Im", "As"])
 
     ship = perfect_stranger
-
     data_loader = DataLoader(ship.max_jump())
 
+    trade_snapshot = "http://travellertools.azurewebsites.net/Home/TradeInfo?sectorX=-3&sectorY=0&hexX=22&hexY=25&maxJumpDistance=1&brokerScore=2&advancedMode=False&illegalGoods=False&edition=Mongoose2&seed=1439744872&advancedCharacters=False&streetwiseScore=0&milieu=M1105"
+    
     #start = data_loader.load_world_data(SectorHex("Trojan Reach", "2819"))
     #stops = [
     #]
 
     start = data_loader.load_world_data(SectorHex("Reft", "2225"))
+
+    if trade_snapshot:
+        snapshot = get_trade_snapshot(trade_snapshot)
+        start.set_trade_snapshot(snapshot)
+
     stops = [
         SectorHex("Reft", "2325"),
         SectorHex("Reft", "1426"),
@@ -725,7 +902,7 @@ def main():
     
     stops = [data_loader.load_world_data(stop) for stop in stops]
     
-    capital = 25000 + 12950 + 10000
+    capital = 64950
     profit = 0
     duration = 0
     max_profit = None
