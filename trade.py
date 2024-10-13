@@ -179,7 +179,7 @@ class World:
         
         return None
     
-    def freight_snapshot(self, cargo):
+    def freight_snapshot(self, other_world, cargo):
         if not self.has_snapshot():
             return None, None
         
@@ -187,8 +187,12 @@ class World:
         total = 0
         vars = []
 
-        for item in self.__trade_snapshot["freight"]:
-            variable = pulp.LpVariable(f"{item['tons']}x {item["contents"]}", cat="Binary")
+        freight = self.__trade_snapshot["planets"][other_world.name]["freight"]
+        i = 0
+
+        for item in freight:
+            i+= 1
+            variable = pulp.LpVariable(f"x{i}", cat="Binary")
             total += item["tons"] * variable
             vars.append(variable)
 
@@ -196,7 +200,7 @@ class World:
         problem += total
         problem.solve(pulp.PULP_CBC_CMD(msg=False))
 
-        freight = [self.__trade_snapshot["freight"][i] for i, variable in enumerate(vars) if pulp.value(variable) == 1]
+        freight = [freight[i] for i, variable in enumerate(vars) if pulp.value(variable) == 1]
         freight = [f"{item['tons']}x {item["contents"]}" for item in freight]
         return pulp.value(total), ",".join(freight)
     
@@ -228,7 +232,7 @@ class World:
         distance = self.distance(other_world)
 
         if starting_world and self.has_snapshot():
-            return self.__trade_snapshot["passengers"][level]
+            return self.__trade_snapshot["planets"][other_world.name]["passengers"][level]
 
         modifier = ship.max_steward
 
@@ -376,9 +380,11 @@ class World:
         if cargo > 0:
             freight_revenue = 0
 
-            if starting_planet and self.has_snapshot() and distance == self.__trade_snapshot["maxJumpDistance"]:
-                cargo, text = self.freight_snapshot(cargo)
+            if starting_planet and self.has_snapshot():
+                tons, text = self.freight_snapshot(other_world, cargo)
                 executed_deals.append(f"Carrying the following Freight: {text}")
+                executed_deals.append(f"Remaining cargo is {cargo - tons}")
+                cargo = tons
 
             freight_revenue = cargo * freight_per_ton
             executed_deals.append(f"Do {cargo} tons of freight for {freight_revenue} capital: {final_capital:,.2f}->{final_capital + freight_revenue:,.2f}")
@@ -852,22 +858,25 @@ def get_trade_snapshot(url):
 
     d["desiredGoods"] = list(parse_table(table))
 
-    header = soup.find('h3', string='Freight')
-    table = header.find_next('table')
+    info = header.find_next("h3", string="Planet Info")
+    d["planets"] = {}
 
-    d["freight"] = list(parse_table(table))
+    while info:
+        planet_name = info.find_next('table').find_all("td")[0].get_text(strip=True)
+        data = d["planets"][planet_name] = {}
 
-    d["passengers"] = {
-        "high": len(soup.find_all("div", string="Passage Desired: High")),
-        "middle": len(soup.find_all("div", string="Passage Desired: Middle")),
-        "basic": len(soup.find_all("div", string="Passage Desired: Basic")),
-        "low": len(soup.find_all("div", string="Passage Desired: Low")),
-    }
+        passengers = info.find_next("h3", string="Passengers").find_next("ul")
+        data["passengers"] = {
+            "high": len(passengers.find_all("div", string="Passage Desired: High")),
+            "middle": len(passengers.find_all("div", string="Passage Desired: Middle")),
+            "basic": len(passengers.find_all("div", string="Passage Desired: Basic")),
+            "low": len(passengers.find_all("div", string="Passage Desired: Low")),
+        }
 
-    parsed_url = urlparse(url)
-    query_params = parse_qs(parsed_url.query)
+        freight = info.find_next("h3", string="Freight").find_next("table")
+        data["freight"] = list(parse_table(freight))
 
-    d["maxJumpDistance"] = int(query_params["maxJumpDistance"][0])
+        info = info.find_next("h3", string="Planet Info")
 
     return d
 
@@ -881,11 +890,19 @@ def main():
     ship = perfect_stranger
     data_loader = DataLoader(ship.max_jump())
 
-    trade_snapshot = "http://travellertools.azurewebsites.net/Home/TradeInfo?sectorX=-3&sectorY=0&hexX=22&hexY=25&maxJumpDistance=1&brokerScore=2&advancedMode=False&illegalGoods=False&edition=Mongoose2&seed=1439744872&advancedCharacters=False&streetwiseScore=0&milieu=M1105"
+    trade_snapshot = "http://travellertools.azurewebsites.net/Home/TradeInfo?sectorX=-3&sectorY=0&hexX=22&hexY=25&maxJumpDistance=5&brokerScore=2&advancedMode=False&illegalGoods=False&edition=Mongoose2&seed=1439744872&advancedCharacters=False&streetwiseScore=0&milieu=M1105"
     
     #start = data_loader.load_world_data(SectorHex("Trojan Reach", "2819"))
     #stops = [
     #]
+
+    parsed_url = urlparse(trade_snapshot)
+    query_params = parse_qs(parsed_url.query)
+    maxJumpDistance = int(query_params.get('maxJumpDistance', [0])[0])
+
+    if maxJumpDistance != ship.max_jump():
+        print(f"Snapshot jump distance should be {ship.max_jump()} not {maxJumpDistance}")
+        exit(1)
 
     start = data_loader.load_world_data(SectorHex("Reft", "2225"))
 
