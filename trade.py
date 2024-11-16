@@ -299,8 +299,9 @@ class World:
         for passage in ship.passage:
             ticket_price = self.data_loader.passage(passage.type, distance)
             passengers = min(self.__passenger_count(passage.type, ship, other_world, starting_world), passage.number)
-            passenger_revenue += passengers * ticket_price
-            passage_descriptions.append(f"{passengers} {passage.type} at {ticket_price}")
+            life_support = self.data_loader.life_support(passage.type) * distance / 4
+            passenger_revenue += passengers * (ticket_price - life_support)
+            passage_descriptions.append(f"{passengers} {passage.type} at {ticket_price} with life support of {life_support}")
 
             if passage.type == "middle" and passengers < passage.number:
                 passengers = min(self.__passenger_count("basic", ship, other_world, starting_world), (passage.number - passengers) * 2)
@@ -389,6 +390,8 @@ class World:
             freight_revenue = cargo * freight_per_ton
             executed_deals.append(f"Do {cargo} tons of freight for {freight_revenue} capital: {final_capital:,.2f}->{final_capital + freight_revenue:,.2f}")
             final_capital += freight_revenue
+        else:
+            executed_deals.append("Cargo is full, no freight")
         
         executed_deals.append(f"Cash after goods are purchased is {capital:,.2f}")
 
@@ -420,6 +423,9 @@ class Mortgage:
     
     def monthly_income(self):
         return 0
+    
+    def current_cut(self, _):
+        return 0
 
 class Ship:
     def __init__(self, monthly_maint, fuel_per_jump, max_jump, fuel_tank, cargo, cargo_fuel, passage, contract, max_steward, max_broker, banned_allegiances =[]) -> None:
@@ -434,6 +440,16 @@ class Ship:
         self.max_steward = max_steward
         self.max_broker = max_broker
         self.banned_allegiances = banned_allegiances
+
+    def monthly_life_support(self, data_loader):
+        life_support = 0
+
+        for passage in self.passage:
+            if passage.type == "low":
+                continue
+            life_support += data_loader.life_support(passage.type) * passage.number
+
+        return life_support
 
     def cargo_capacity(self, distance):
         fuel_required = distance * self.__fuel_per_jump
@@ -500,6 +516,7 @@ class DataLoader:
         self.__passage_freight = None
         self.__passenger_count = None
         self.__modified_price = None
+        self.__life_support = None
 
     @staticmethod
     def __jump_worlds(sector, hex, max_jump):
@@ -553,7 +570,13 @@ class DataLoader:
                     self.__trade_goods.append(TradeGood(tradeGoodRaw, self))
 
         return self.__trade_goods
+    
+    def life_support(self, level):
+        if self.__life_support is None:
+            with open('lifeSupport.json', 'r') as file:
+                self.__life_support = json.load(file)
 
+        return self.__life_support[level]
 
     def passenger_count(self, roll):
         if roll < 1:
@@ -608,16 +631,20 @@ class CompleteCondition:
             return True
         
         return False
-        
+
+STARTING_NET_WORTH = "STARTING_NET_WORTH"
+
 class Route:
-    def __init__(self, starting_capital, worlds, complete_condition, ship, data_loader, start_duration, route_duration = 0,state=dict(),profit =0, text=[]) -> None:
+    def __init__(self, starting_capital, starting_net_worth, worlds, avoid, complete_condition, ship, data_loader, start_duration, route_duration = 0, state=dict(),profit =0, text=[]) -> None:
         self.profit = profit
         self.starting_capital = starting_capital
+        self.starting_net_worth = starting_net_worth
         self.complete_condition = complete_condition
         self.complete = complete_condition.is_complete(worlds[-1], route_duration, profit)
         self.state = state
         self.start_duration = start_duration
         self.worlds = worlds
+        self.avoid = avoid
         self.text = text
         self.ship = ship
 
@@ -640,6 +667,8 @@ class Route:
             if self.worlds[-10:].count(other_world) > 1:
                 continue
 
+            if other_world in self.avoid:
+                continue
             if len(current_world.neighbours) > 2 and len(self.worlds) > 1 and self.worlds[-2] == other_world:
                 continue
 
@@ -663,6 +692,36 @@ class Route:
             cost = self.ship.fuel_cost(distance)
             text.append(f"Buy unrefined fuel for {cost}, capital {capital:,.2f}->{capital - cost:,.2f}")
             capital -= cost
+            duration = self.ship.jumps_required(distance) + 1
+            total_duration = self.total_duration + duration
+            state = self.state.copy()
+
+            if math.floor(self.total_duration / 4) < math.floor(total_duration / 4):
+                text.append(f"Ship Maintenance paid of {self.ship.monthly_maint:,.2f}, capital: {capital:,.2f}->{capital-self.ship.monthly_maint:,.2f}")
+                capital -= self.ship.monthly_maint
+
+                life_support = self.ship.monthly_life_support(self.data_loader)
+                text.append(f"Ship Life Support paid of {life_support:,.2f}, capital: {capital:,.2f}->{capital-life_support:,.2f}")
+                capital -= life_support
+
+                if self.ship.contract:
+                    income = self.ship.contract.monthly_income()
+
+                    if income > 0:
+                        text.append(f"Monthly Income of {income:,.2f}, capital: {capital:,.2f}->{capital+income:,.2f}")
+                        capital += income
+
+                    mortgage_payment = self.ship.contract.mortgage_payment(state)
+                    if mortgage_payment > 0:
+                        text.append(f"Mortgage paid of {mortgage_payment:,.2f}, capital: {capital:,.2f}->{capital-mortgage_payment:,.2f}")
+                        capital -= mortgage_payment
+
+            passenger_revenue, description = current_world.passengers(other_world, self.ship, starting_world)
+
+            if passenger_revenue > 0: 
+                text.append(f"{description}, capital {capital:,.2f}->{passenger_revenue + capital:,.2f}")
+                capital += passenger_revenue 
+
             starting_capital, final_capital, deals = current_world.best_trades(other_world, trade_goods, self.ship, capital, starting_world)
 
             if starting_capital is None:
@@ -670,46 +729,25 @@ class Route:
 
             text += deals
 
-            passenger_revenue, description = current_world.passengers(other_world, self.ship, starting_world)
-
-            if passenger_revenue > 0: 
-                text.append(f"{description}, capital {final_capital:,.2f}->{passenger_revenue + final_capital:,.2f}")
-                final_capital += passenger_revenue 
-
-            duration = self.ship.jumps_required(distance) + 1
-            total_duration = self.total_duration + duration
-            state = self.state.copy()
-
             if self.ship.contract:
                 cut, description = self.ship.contract.profit_cut(state, other_world, starting_capital, final_capital)
 
                 if cut is not None:
                     text.append(description)
                     final_capital -= cut
-
-            if math.floor(self.total_duration / 4) < math.floor(total_duration / 4):
-                text.append(f"Ship Maintenance paid of {self.ship.monthly_maint:,.2f}, capital: {final_capital:,.2f}->{final_capital-self.ship.monthly_maint:,.2f}")
-                final_capital -= self.ship.monthly_maint
-
-                if self.ship.contract:
-                    income = self.ship.contract.monthly_income()
-
-                    if income > 0:
-                        text.append(f"Monthly Income of {income:,.2f}, capital: {final_capital:,.2f}->{final_capital+income:,.2f}")
-                        final_capital += income
-
-                    mortgage_payment = self.ship.contract.mortgage_payment(state)
-                    if mortgage_payment > 0:
-                        text.append(f"Mortgage paid of {mortgage_payment:,.2f}, capital: {final_capital:,.2f}->{final_capital-mortgage_payment:,.2f}")
-                        final_capital -= mortgage_payment
             else:
                 text.append(f"No Maint or mortgage as we go from {self.total_duration}->{total_duration}")
 
             if final_capital < 0:
                 continue
+
+            new_net_worth = final_capital
+
+            if self.ship.contract:
+                new_net_worth -= self.ship.contract.current_cut(state)
                 
-            text = self.text + [f"{bcolors.BOLD}{current_world.name} -> {other_world.name}{bcolors.ENDC} ({distance} hexes, {duration} weeks) {other_world.sector_hex} capital {self.starting_capital + self.profit:,.2f} -> {final_capital:,.2f}"] + text
-            yield Route(self.starting_capital, self.worlds.copy() + [other_world], self.complete_condition, self.ship, self.data_loader, self.start_duration, total_duration,state, final_capital - self.starting_capital, text)
+            text = self.text + [f"{bcolors.BOLD}{current_world.name} -> {other_world.name}{bcolors.ENDC} ({distance} hexes, {duration} weeks) {other_world.sector_hex} net worth {self.net_worth():,.2f} -> {new_net_worth:,.2f}"] + text
+            yield Route(self.starting_capital, self.starting_net_worth, self.worlds.copy() + [other_world],self.avoid, self.complete_condition, self.ship, self.data_loader, self.start_duration, total_duration,state, final_capital - self.starting_capital, text)
 
     def projected_duration(self):
         if self.complete or not self.complete_condition.destination:
@@ -718,15 +756,33 @@ class Route:
         remaining_distance = self.worlds[-1].distance(self.complete_condition.destination)
         remaining_duration = self.ship.expected_duration(remaining_distance)
         return self.route_duration + remaining_duration
+
+    def crow_flies(self):
+        if self.complete or not self.complete_condition.destination:
+            return self.route_duration
+
+        return self.worlds[0].distance(self.complete_condition.destination)
+    
+    def net_worth(self):
+        net_worth = self.profit + self.starting_capital
+
+        if self.ship.contract:
+            net_worth -= self.ship.contract.current_cut(self.state)
+
+        return net_worth
+
+    def real_profit(self):
+        return self.net_worth() - self.starting_net_worth
     
     def profit_per_week(self):
-        return self.profit / self.route_duration
+        return self.real_profit() / self.route_duration
 
     def __lt__(self, other):
         if other is None:
             return True
         
         factor = self.projected_duration() / other.projected_duration()
+
         other_capital_normalised = other.profit_per_week() * factor
         return self.profit_per_week() > other_capital_normalised
 
@@ -734,8 +790,8 @@ class Route:
     def __eq__(self, other):
         return False
         
-def find_best_route(capital, ship, data_loader, start, destination, start_duration):
-    routes = [Route(capital, [start], destination, ship, data_loader, start_duration)]
+def find_best_route(capital, net_worth, ship, data_loader, start, destination, start_duration,avoid, state):
+    routes = [Route(capital, net_worth, [start], avoid, destination, ship, data_loader, start_duration, state=state)]
     heapq.heapify(routes)
     best_route = None
     completed_routes = 0
@@ -770,6 +826,9 @@ class PerfectStrangerContract:
     
     def monthly_income(self):
         return 0
+    
+    def current_cut(self, state):
+        return state.get(UNCUT_PROFITS, 0) * .75
     
     def profit_cut(self, state, world, starting_capital, final_capital):
         if final_capital < starting_capital:
@@ -891,7 +950,7 @@ def main():
     ship = perfect_stranger
     data_loader = DataLoader(ship.max_jump())
 
-    trade_snapshot = "http://travellertools.azurewebsites.net/Home/TradeInfo?sectorX=-3&sectorY=0&hexX=22&hexY=25&maxJumpDistance=5&brokerScore=2&advancedMode=False&illegalGoods=False&edition=Mongoose2&seed=1439744872&advancedCharacters=False&streetwiseScore=0&milieu=M1105"
+    trade_snapshot = "https://travellertools.azurewebsites.net/Home/TradeInfo?sectorX=-3&sectorY=0&hexX=18&hexY=22&maxJumpDistance=5&brokerScore=2&advancedMode=False&illegalGoods=False&edition=Mongoose2&seed=1583474473&advancedCharacters=False&streetwiseScore=2&milieu=M1105"
     
     #start = data_loader.load_world_data(SectorHex("Trojan Reach", "2819"))
     #stops = [
@@ -905,49 +964,61 @@ def main():
         print(f"Snapshot jump distance should be {ship.max_jump()} not {maxJumpDistance}")
         exit(1)
 
-    start = data_loader.load_world_data(SectorHex("Reft", "2225"))
+    start = data_loader.load_world_data(SectorHex("Reft", "1822"))
 
     if trade_snapshot:
         snapshot = get_trade_snapshot(trade_snapshot)
         start.set_trade_snapshot(snapshot)
 
     stops = [
-        SectorHex("Reft", "2325"),
         SectorHex("Reft", "1426"),
+    ]
+
+    avoid = [
     ]
 
     print(f"{bcolors.OKBLUE}Planning new Route{bcolors.ENDC}")
     
     stops = [data_loader.load_world_data(stop) for stop in stops]
+    avoid = [data_loader.load_world_data(world) for world in avoid]
     
-    capital = 64950
+    capital = 1943650
+    uncut_profits = capital - 165175
     profit = 0
     duration = 0
     max_profit = None
     max_duration = None
     percentage_increase = 0
+    state = {
+        UNCUT_PROFITS: uncut_profits
+    }
+    net_worth = capital
+
+    if ship.contract:
+        net_worth -= ship.contract.current_cut(state)
 
     for stop in stops:
-        best_route = find_best_route(capital + profit, ship, data_loader, start, CompleteCondition(stop), duration)
+        best_route = find_best_route(capital + profit,net_worth, ship, data_loader, start, CompleteCondition(stop), duration, avoid, state)
+        state = best_route.state
         if best_route is None:
             print("Unable to find viable route")
             return
 
         print("\n".join(best_route.text))
         duration += best_route.route_duration
-        percentage_increase += (duration * best_route.profit) / (capital + profit)
-        profit += best_route.profit
+        percentage_increase += (duration * best_route.real_profit()) / (net_worth + profit)
+        profit += best_route.real_profit()
 
         start = stop
 
     if max_profit is not None or max_duration is not None:
-        best_route = find_best_route(capital, ship, data_loader, start, CompleteCondition(max_profit=max_profit, max_duration=max_duration), duration)
+        best_route = find_best_route(capital, net_worth, ship, data_loader, start, CompleteCondition(max_profit=max_profit, max_duration=max_duration), duration, avoid)
         if best_route is None:
             print("Unable to find viable route")
             return
         duration = best_route.route_duration
-        percentage_increase = (duration * best_route.profit) / capital
-        profit = best_route.profit
+        percentage_increase = (duration * best_route.real_profit()) / net_worth
+        profit = best_route.real_profit()
         print("\n".join(best_route.text))
     
     print(f"Route takes {duration} weeks and a total profit of {profit:,.2f} which is {profit/duration:,.2f} or {percentage_increase/ duration:,.2f}% per week")
